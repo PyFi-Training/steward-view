@@ -1,0 +1,15 @@
+Personal-Use, No-Redistribution License for Students
+
+Definitions. “Materials” means all of the content in this repository. "Licensor" is Machine Learning Edge Inc. dba PyFi.
+
+Grant. Upon your enrollment in the course, Licensor grants you a limited, non-exclusive, non-transferable, revocable license to view, download, and modify the Materials for use in your own private, non-commercial projects.
+
+Restrictions. You may not publicly redistribute the Materials or any derivative works in whole or in part (including posting to public repositories) or use the Materials for commercial purposes.
+
+Ownership. The Materials are licensed, not sold. Licensor retains all rights not expressly granted.
+
+Termination. This license terminates automatically upon breach. Upon termination, you must delete all copies of the Materials and any derivative works you created from them.
+
+Warranty / Liability. Licensor provides the Materials “AS IS” without warranties of any kind. To the maximum extent permitted by law, Licensor is not liable for any claims or damages arising from use of the Materials.
+
+Contact. Send license questions to support@pyfi.com.
