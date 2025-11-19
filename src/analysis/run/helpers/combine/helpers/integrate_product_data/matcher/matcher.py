@@ -3,6 +3,7 @@ import pickle
 from dotmap import DotMap
 import pandas as pd
 pd.options.mode.copy_on_write = True
+from textwrap import dedent
 from tqdm.auto import tqdm as ProgressBar
 from .helpers import *
 
@@ -153,7 +154,7 @@ class Matcher:
         
     
     def print_results(self):
-        print(f'''
+        print(dedent(f'''\
         Payments:
             Original: {len(self.pmts.original)}
             Filtered: {len(self.pmts.filtered)}
@@ -166,4 +167,4 @@ class Matcher:
             Unmatched: {len(self.prods.unmatched)}
             Other: {len(self.prods.other)}
             Orders: {len(self.prods.order_ids)}
-        ''')
+        '''))
