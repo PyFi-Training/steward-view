@@ -1,3 +1,4 @@
 streamlit>=1.31
 python-dotenv>=1.0
+plotly>=5.18
 -e .
