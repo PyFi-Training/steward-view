@@ -3,7 +3,7 @@ import io
 import time
 import pickle
 from pathlib import Path
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 
 import pandas as pd
 import plotly.express as px
@@ -27,6 +27,16 @@ MATCHER_PATH = OUTPUT_DIR / "matcher.pkl"
 # Chart thresholds (mirrors src/analysis/config/charts.py)
 CATEGORY_MIN = 500
 VENDOR_MIN = 500
+
+# Pipeline steps in order (label, description, has_progress_bar)
+PIPELINE_STEPS = [
+    ("load_data", "Loading data files",          False),
+    ("tag",       "Tagging transactions",         False),
+    ("clean",     "Cleaning data",                False),
+    ("combine",   "Combining & matching orders",  True),   # Matching Amazon Orders
+    ("label",     "Labeling with OpenAI",         True),   # Labeling Rows with OpenAI
+    ("analyze",   "Analyzing results",            False),
+]
 
 
 # ----------------------------
@@ -86,15 +96,82 @@ def load_matcher_counter(path: Path):
     return getattr(matcher, "counter", None)
 
 
-def run_pipeline():
-    import analysis
+def run_pipeline_with_progress():
+    """Run the pipeline step-by-step with Streamlit progress indicators."""
+    from analysis.run.helpers import load_data, tag, clean, combine, label, analyze
+
+    step_functions = {
+        "load_data": load_data,
+        "tag": tag,
+        "clean": clean,
+        "combine": combine,
+        "label": label,
+        "analyze": analyze,
+    }
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    buf = io.StringIO()
+    all_logs = []
+    data = None
+    total_steps = len(PIPELINE_STEPS)
+
+    progress_bar = st.progress(0, text="Starting pipeline...")
+    status_container = st.status("Running pipeline...", expanded=True)
+
     start = time.time()
-    with redirect_stdout(buf):
-        analysis.run()
+
+    for i, (step_key, step_desc, has_progress) in enumerate(PIPELINE_STEPS):
+        progress_pct = i / total_steps
+        progress_bar.progress(progress_pct, text=f"Step {i+1}/{total_steps}: {step_desc}")
+
+        step_fn = step_functions[step_key]
+        step_start = time.time()
+
+        # Show extra detail for steps with progress bars
+        if has_progress and step_key == "combine":
+            status_container.write(f"⏳ **{step_desc}** — Matching Amazon Orders...")
+        elif has_progress and step_key == "label":
+            status_container.write(f"⏳ **{step_desc}** — Labeling Rows with OpenAI...")
+        else:
+            status_container.write(f"⏳ **{step_desc}**...")
+
+        # Capture stdout from each step
+        buf = io.StringIO()
+        err_buf = io.StringIO()
+        try:
+            with redirect_stdout(buf), redirect_stderr(err_buf):
+                if step_key == "load_data":
+                    data = step_fn()
+                elif step_key == "analyze":
+                    step_fn(data)
+                else:
+                    data = step_fn(data)
+        except Exception:
+            progress_bar.progress(progress_pct, text=f"❌ Failed at: {step_desc}")
+            status_container.update(label="Pipeline failed", state="error", expanded=True)
+            raise
+
+        step_elapsed = time.time() - step_start
+        step_logs = buf.getvalue()
+        step_err = err_buf.getvalue()
+
+        if step_logs.strip():
+            all_logs.append(f"--- {step_desc} ---\n{step_logs.strip()}")
+
+        # Show tqdm output if captured from stderr
+        if step_err.strip() and has_progress:
+            # Extract the final line of tqdm output (the completed bar)
+            tqdm_lines = [l for l in step_err.strip().split("\n") if l.strip()]
+            if tqdm_lines:
+                final_bar = tqdm_lines[-1].strip()
+                status_container.write(f"  ✅ {final_bar}")
+
+        status_container.write(f"  ✅ **{step_desc}** — done ({step_elapsed:.1f}s)")
+
     elapsed = time.time() - start
-    logs = buf.getvalue()
+    progress_bar.progress(1.0, text=f"✅ Pipeline complete ({elapsed:.1f}s)")
+    status_container.update(label=f"Pipeline complete ({elapsed:.1f}s)", state="complete", expanded=False)
+
+    logs = "\n".join(all_logs)
     return elapsed, logs
 
 
@@ -107,6 +184,19 @@ def run_chat_question(question: str):
     printed = buf.getvalue().strip()
     returned = ret.strip() if isinstance(ret, str) else ""
     return returned, printed
+
+
+def clear_output_files():
+    """Delete output files so students start from scratch."""
+    deleted = []
+    for path in [CSV_PATH, MATCHER_PATH]:
+        if path.exists():
+            try:
+                path.unlink()
+                deleted.append(path.name)
+            except Exception:
+                pass
+    return deleted
 
 
 # ----------------------------
@@ -239,13 +329,17 @@ with st.container(border=True):
         st.caption(f"{'✅' if csv_exists else '⚠️'} labeled_data.csv")
         st.caption(f"{'✅' if matcher_exists else '⚠️'} matcher.pkl")
 
-    # Refresh
+    # Refresh — clears output files and cache so students start over
     with c4:
         st.write("")
         st.write("")
         if st.button("🔄 Refresh data", use_container_width=True):
+            deleted = clear_output_files()
             st.cache_data.clear()
-            st.toast("Cache cleared. Data will reload.", icon="✅")
+            if deleted:
+                st.toast(f"Deleted: {', '.join(deleted)}. Cache cleared.", icon="🗑️")
+            else:
+                st.toast("No output files to delete. Cache cleared.", icon="✅")
         st.write("")
 
 
@@ -261,28 +355,26 @@ if run_btn:
     if not os.environ.get("OPENAI_API_KEY"):
         st.error("An OpenAI API key is required to run the pipeline. Paste your key above.")
     else:
-        with st.spinner("Running pipeline…"):
-            try:
-                elapsed, logs = run_pipeline()
-                st.session_state.last_run_logs = logs
-                st.session_state.last_run_time = elapsed
-                st.cache_data.clear()
-                st.success(f"Pipeline completed in {elapsed:.1f}s")
-                if logs.strip():
-                    with st.expander("📜 Console logs (latest run)", expanded=False):
-                        st.text_area("Output", logs, height=260)
-                        st.download_button(
-                            "⬇️ Download logs",
-                            data=logs.encode("utf-8"),
-                            file_name="pipeline_logs.txt",
-                            mime="text/plain",
-                            use_container_width=True,
-                        )
-                else:
-                    st.info("No console output captured.")
-            except Exception as e:
-                st.error("Pipeline failed. See error below.")
-                st.exception(e)
+        try:
+            elapsed, logs = run_pipeline_with_progress()
+            st.session_state.last_run_logs = logs
+            st.session_state.last_run_time = elapsed
+            st.cache_data.clear()
+            if logs.strip():
+                with st.expander("📜 Console logs (latest run)", expanded=False):
+                    st.text_area("Output", logs, height=260)
+                    st.download_button(
+                        "⬇️ Download logs",
+                        data=logs.encode("utf-8"),
+                        file_name="pipeline_logs.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                    )
+            else:
+                st.info("No console output captured.")
+        except Exception as e:
+            st.error("Pipeline failed. See error below.")
+            st.exception(e)
 elif st.session_state.last_run_time is not None:
     st.caption(f"Last run: {st.session_state.last_run_time:.1f}s")
 
