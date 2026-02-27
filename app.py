@@ -1,9 +1,11 @@
 import os
 import io
+import sys
 import time
 import pickle
 from pathlib import Path
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 import pandas as pd
 import plotly.express as px
@@ -28,14 +30,14 @@ MATCHER_PATH = OUTPUT_DIR / "matcher.pkl"
 CATEGORY_MIN = 500
 VENDOR_MIN = 500
 
-# Pipeline steps in order (label, description, has_progress_bar)
+# Pipeline steps in order
 PIPELINE_STEPS = [
-    ("load_data", "Loading data files",          False),
-    ("tag",       "Tagging transactions",         False),
-    ("clean",     "Cleaning data",                False),
-    ("combine",   "Combining & matching orders",  True),   # Matching Amazon Orders
-    ("label",     "Labeling with OpenAI",         True),   # Labeling Rows with OpenAI
-    ("analyze",   "Analyzing results",            False),
+    ("load_data", "Loading data files"),
+    ("tag",       "Tagging transactions"),
+    ("clean",     "Cleaning data"),
+    ("combine",   "Combining & matching Amazon orders"),
+    ("label",     "Labeling transactions with OpenAI"),
+    ("analyze",   "Analyzing results"),
 ]
 
 
@@ -89,11 +91,31 @@ def safe_load_pickle(path: Path):
         return None
 
 
-def load_matcher_counter(path: Path):
-    matcher = safe_load_pickle(path)
-    if matcher is None:
-        return None
-    return getattr(matcher, "counter", None)
+def load_matcher(path: Path):
+    """Load the full Matcher object from pickle."""
+    return safe_load_pickle(path)
+
+
+def _count_amazon_orders(data):
+    """Extract the number of Amazon order dates from pipeline data."""
+    try:
+        amzn = data.get("amzn") or data.get("prods")
+        if amzn is not None and "date" in amzn.columns:
+            return amzn["date"].nunique()
+    except Exception:
+        pass
+    return None
+
+
+def _count_combined_rows(data):
+    """Extract the number of rows in the combined table."""
+    try:
+        combined = data.get("combined")
+        if combined is not None:
+            return len(combined)
+    except Exception:
+        pass
+    return None
 
 
 def run_pipeline_with_progress():
@@ -119,26 +141,31 @@ def run_pipeline_with_progress():
 
     start = time.time()
 
-    for i, (step_key, step_desc, has_progress) in enumerate(PIPELINE_STEPS):
+    for i, (step_key, step_desc) in enumerate(PIPELINE_STEPS):
         progress_pct = i / total_steps
         progress_bar.progress(progress_pct, text=f"Step {i+1}/{total_steps}: {step_desc}")
 
         step_fn = step_functions[step_key]
         step_start = time.time()
 
-        # Show extra detail for steps with progress bars
-        if has_progress and step_key == "combine":
-            status_container.write(f"⏳ **{step_desc}** — Matching Amazon Orders...")
-        elif has_progress and step_key == "label":
-            status_container.write(f"⏳ **{step_desc}** — Labeling Rows with OpenAI...")
+        # Show context-aware detail for heavy steps
+        if step_key == "combine":
+            n_orders = _count_amazon_orders(data) if data else None
+            detail = f" ({n_orders} Amazon orders)" if n_orders else ""
+            status_container.write(f"⏳ **{step_desc}**{detail}...")
+        elif step_key == "label":
+            n_rows = _count_combined_rows(data) if data else None
+            detail = f" ({n_rows} rows)" if n_rows else ""
+            status_container.write(f"⏳ **{step_desc}**{detail}...")
         else:
             status_container.write(f"⏳ **{step_desc}**...")
 
-        # Capture stdout from each step
+        # Capture stdout; discard stderr (tqdm writes \r-based progress
+        # to stderr which only captures the initial 0% line — misleading)
         buf = io.StringIO()
-        err_buf = io.StringIO()
+        devnull = open(os.devnull, "w")
         try:
-            with redirect_stdout(buf), redirect_stderr(err_buf):
+            with redirect_stdout(buf), patch.object(sys, "stderr", devnull):
                 if step_key == "load_data":
                     data = step_fn()
                 elif step_key == "analyze":
@@ -149,21 +176,14 @@ def run_pipeline_with_progress():
             progress_bar.progress(progress_pct, text=f"❌ Failed at: {step_desc}")
             status_container.update(label="Pipeline failed", state="error", expanded=True)
             raise
+        finally:
+            devnull.close()
 
         step_elapsed = time.time() - step_start
         step_logs = buf.getvalue()
-        step_err = err_buf.getvalue()
 
         if step_logs.strip():
             all_logs.append(f"--- {step_desc} ---\n{step_logs.strip()}")
-
-        # Show tqdm output if captured from stderr
-        if step_err.strip() and has_progress:
-            # Extract the final line of tqdm output (the completed bar)
-            tqdm_lines = [l for l in step_err.strip().split("\n") if l.strip()]
-            if tqdm_lines:
-                final_bar = tqdm_lines[-1].strip()
-                status_container.write(f"  ✅ {final_bar}")
 
         status_container.write(f"  ✅ **{step_desc}** — done ({step_elapsed:.1f}s)")
 
@@ -595,28 +615,145 @@ with tab_data:
 # Tab: Matcher
 # ----------------------------
 with tab_matcher:
-    st.subheader("Amazon Matcher Results")
+    st.subheader("Amazon Order Matcher")
     st.caption(
-        "The matching algorithm reconciles Amazon product purchases with "
-        "credit-card charges. This table shows how many charges each rule resolved."
+        "The matcher reconciles Amazon product purchases (from order history) "
+        "with bank charges (from credit card statements). It replaces vague "
+        "\"AMAZON\" bank charges with itemized product-level records so the "
+        "pipeline can classify spending by actual product category."
     )
 
-    counter = load_matcher_counter(MATCHER_PATH)
-    if counter is None:
+    matcher_obj = load_matcher(MATCHER_PATH)
+    if matcher_obj is None:
         st.info("No matcher data found (matcher.pkl missing or unreadable). Run the pipeline first.")
     else:
-        try:
-            cdf = pd.DataFrame(
-                {"Rule": list(counter.keys()), "Charges Reconciled": list(counter.values())}
+        # ---- Summary metrics ----
+        counter = getattr(matcher_obj, "counter", None)
+        pmts = getattr(matcher_obj, "pmts", None)
+        prods = getattr(matcher_obj, "prods", None)
+
+        if counter:
+            st.write("**How it works**")
+            st.markdown(
+                "The matcher tries three strategies per Amazon order, in order:\n\n"
+                "1. **match_all_products** — Does the total cost of all products in "
+                "the order equal a single bank charge?\n"
+                "2. **match_single_products** — Does any single product's cost match "
+                "a bank charge?\n"
+                "3. **match_product_combos** — Does any combination of products' costs "
+                "match a bank charge?\n"
             )
+
+            st.divider()
+
+            # Top-line metrics
+            m1, m2, m3, m4 = st.columns(4)
+            total_reconciled = sum(counter.values())
+            m1.metric("Charges Reconciled", f"{total_reconciled:,}")
+            if pmts:
+                n_filtered = len(getattr(pmts, "filtered", []))
+                n_unmatched_pmts = len(getattr(pmts, "unmatched", []))
+                m2.metric("Amazon Bank Charges", f"{n_filtered:,}")
+                m3.metric("Unmatched Charges", f"{n_unmatched_pmts:,}")
+            if prods:
+                n_prods = len(getattr(prods, "original", []))
+                m4.metric("Products in Order History", f"{n_prods:,}")
+
+            st.divider()
+
+            # Strategy breakdown
+            st.write("**Reconciliation by Strategy**")
+            cdf = pd.DataFrame(
+                {"Strategy": list(counter.keys()), "Charges Reconciled": list(counter.values())}
+            )
+            # Make strategy names more readable
+            name_map = {
+                "match_all_products": "Match All Products (whole order = one charge)",
+                "match_single_products": "Match Single Products (one product = one charge)",
+                "match_product_combos": "Match Product Combos (subset of products = one charge)",
+            }
+            cdf["Strategy"] = cdf["Strategy"].map(name_map).fillna(cdf["Strategy"])
             cdf = cdf.sort_values("Charges Reconciled", ascending=False)
+            st.dataframe(cdf, use_container_width=True, hide_index=True)
 
-            total_reconciled = cdf["Charges Reconciled"].sum()
-            st.metric("Total Charges Reconciled", f"{total_reconciled:,}")
+        st.divider()
 
-            st.dataframe(cdf, use_container_width=True, height=360, hide_index=True)
-        except Exception:
-            st.write(counter)
+        # ---- Matched Products detail table ----
+        st.write("**Matched Products (itemized)**")
+        st.caption(
+            "These are the individual Amazon product rows that successfully matched "
+            "to bank charges and replaced them in the final dataset."
+        )
+
+        if prods is not None:
+            prods_original = getattr(prods, "original", None)
+            prods_matched_idx = getattr(prods, "matched", None)
+
+            if prods_original is not None and prods_matched_idx is not None and len(prods_matched_idx) > 0:
+                try:
+                    matched_products = prods_original.loc[prods_matched_idx].copy()
+                    # Select the most useful columns if they exist
+                    display_cols = [c for c in ["date", "description", "amount", "quantity"] if c in matched_products.columns]
+                    if not display_cols:
+                        display_cols = matched_products.columns.tolist()
+                    matched_display = matched_products[display_cols].copy()
+                    if "amount" in matched_display.columns:
+                        matched_display["amount"] = pd.to_numeric(matched_display["amount"], errors="coerce")
+                        matched_display = matched_display.sort_values("amount", ascending=False)
+                    st.dataframe(matched_display, use_container_width=True, height=400, hide_index=True)
+                    st.caption(f"{len(matched_display):,} matched product rows")
+                except Exception as e:
+                    st.warning(f"Could not display matched products: {e}")
+            else:
+                st.info("No matched products found in the matcher data.")
+
+            # ---- Unmatched Products ----
+            prods_unmatched_idx = getattr(prods, "unmatched", None)
+            if prods_original is not None and prods_unmatched_idx is not None and len(prods_unmatched_idx) > 0:
+                st.divider()
+                st.write("**Unmatched Products**")
+                st.caption(
+                    "These products from Amazon order history could not be matched "
+                    "to any bank charge. This can happen when Amazon splits or "
+                    "combines charges in unexpected ways."
+                )
+                try:
+                    unmatched_products = prods_original.loc[prods_unmatched_idx].copy()
+                    display_cols = [c for c in ["date", "description", "amount", "quantity"] if c in unmatched_products.columns]
+                    if not display_cols:
+                        display_cols = unmatched_products.columns.tolist()
+                    unmatched_display = unmatched_products[display_cols].copy()
+                    if "amount" in unmatched_display.columns:
+                        unmatched_display["amount"] = pd.to_numeric(unmatched_display["amount"], errors="coerce")
+                    st.dataframe(unmatched_display, use_container_width=True, height=300, hide_index=True)
+                    st.caption(f"{len(unmatched_display):,} unmatched product rows")
+                except Exception:
+                    pass
+
+        # ---- Unmatched Payments ----
+        if pmts is not None:
+            pmts_filtered = getattr(pmts, "filtered", None)
+            pmts_unmatched_idx = getattr(pmts, "unmatched", None)
+            if pmts_filtered is not None and pmts_unmatched_idx is not None and len(pmts_unmatched_idx) > 0:
+                st.divider()
+                st.write("**Unmatched Amazon Bank Charges**")
+                st.caption(
+                    "These are Amazon-related bank charges that could not be matched "
+                    "to any product in the order history. They remain as-is in the "
+                    "final dataset (labeled by the LLM instead)."
+                )
+                try:
+                    unmatched_pmts = pmts_filtered.loc[pmts_unmatched_idx].copy()
+                    display_cols = [c for c in ["date", "description", "amount"] if c in unmatched_pmts.columns]
+                    if not display_cols:
+                        display_cols = unmatched_pmts.columns.tolist()
+                    unmatched_pmt_display = unmatched_pmts[display_cols].copy()
+                    if "amount" in unmatched_pmt_display.columns:
+                        unmatched_pmt_display["amount"] = pd.to_numeric(unmatched_pmt_display["amount"], errors="coerce")
+                    st.dataframe(unmatched_pmt_display, use_container_width=True, height=300, hide_index=True)
+                    st.caption(f"{len(unmatched_pmt_display):,} unmatched bank charges")
+                except Exception:
+                    pass
 
 
 # ----------------------------
