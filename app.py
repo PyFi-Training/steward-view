@@ -182,8 +182,20 @@ def run_pipeline_with_progress():
         step_elapsed = time.time() - step_start
         step_logs = buf.getvalue()
 
+        # Filter out tqdm progress bar lines that leak into stdout
+        # (tqdm.auto falls back to stdout in non-interactive environments)
         if step_logs.strip():
-            all_logs.append(f"--- {step_desc} ---\n{step_logs.strip()}")
+            import re
+            filtered_lines = []
+            for line in step_logs.strip().split("\n"):
+                # Skip lines that look like tqdm output: "description: XX%|..."
+                # or lines with bar_format patterns like "n_fmt/total_fmt"
+                if re.search(r'\d+%\|', line) or re.search(r'\d+/\d+\s*\[', line):
+                    continue
+                if line.strip():
+                    filtered_lines.append(line)
+            if filtered_lines:
+                all_logs.append(f"--- {step_desc} ---\n" + "\n".join(filtered_lines))
 
         status_container.write(f"  ✅ **{step_desc}** — done ({step_elapsed:.1f}s)")
 
